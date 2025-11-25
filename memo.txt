@@ -1,1 +1,8 @@
 1 の153まではVRFTの記録なし。
+
+
+修正して、rollrateとpitchrateを記録した。
+174 rate roll
+176 rate roll
+178 rate pitch
+180 rate pitch
