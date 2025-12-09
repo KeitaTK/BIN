@@ -6,3 +6,6 @@
 176 rate roll
 178 rate pitch
 180 rate pitch
+
+221の前まででVRFTの記録を計5回分記録した。rollrate2回とpitchrate2回を記録したのち、振動数の最大値を下げたrollrateを1回記録した。
+自分で探してください。
