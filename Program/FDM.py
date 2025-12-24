@@ -20,6 +20,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal
 from scipy.signal import welch, csd
+from scipy.optimize import least_squares
 
 # ArduPilot関連パッケージ
 try:
@@ -47,8 +48,8 @@ class Config:
     
     # ====== ログファイル設定 ======
     # 読み込む .BIN ファイルのパス
-    BIN_FILE_PATH = r"1\00000174.BIN"
-    # BIN_FILE_PATH = r"1\00000315.BIN"
+    # BIN_FILE_PATH = r"1\00000174.BIN"
+    BIN_FILE_PATH = r"1\00000315.BIN"
     
     # 解析するデータタイプを選択
     # - "roll": Roll Rate Loop (RATE.ROut -> SIDD.Gx)
@@ -408,50 +409,180 @@ def compute_bode_plot(time: np.ndarray,
 
 def estimate_step_response(magnitude_db: np.ndarray,
                           phase_deg: np.ndarray,
-                          frequency_hz: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[float]]:
+                          frequency_hz: np.ndarray,
+                          coherence: np.ndarray,
+                          coherence_threshold: float = 0.7) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[float]]:
     """
-    ボード線図からステップ応答を推定
+    測定した周波数応答から1次遅れモデル G(s) = K/(T*s+1) を最小二乗法でフィット
     
     方法:
-    1. 周波数応答を複素数に変換
-    2. 状態空間モデルを構築（フィッティング）
-    3. step_response() で時間応答を計算
+    1. コヒーレンスが閾値（デフォルト0.7）以上のデータのみを使用
+    2. 周波数応答を複素数形式に変換 H(jω_k)
+    3. 1次遅れモデルの周波数応答 G(jω_k; K,T) = K/(1+jω_k*T) を定義
+    4. 残差 e_k = H(jω_k) - G(jω_k; K,T) の実部・虚部について二乗和を最小化
+    5. scipy.optimize.least_squares で非線形最小二乗問題を解く
+    6. 得られたパラメータからステップ応答を計算
+    
+    コヒーレンスフィルタリングにより、ノイズや外乱の影響が大きい
+    周波数帯域を除外し、フィッティング精度を向上させる。
+    この手法は、ゲイン交差周波数の有無に関係なく、
+    測定可能な周波数範囲内でモデルをフィットできる。
+    
+    Parameters:
+    -----------
+    magnitude_db : ゲイン [dB]
+    phase_deg : 位相 [度]
+    frequency_hz : 周波数 [Hz]
+    coherence : コヒーレンス関数値
+    coherence_threshold : コヒーレンス閾値（デフォルト0.7）
     
     Returns:
     --------
     (time_array, step_response_array, tau, settling_time) : tuple
     """
-    print("[DEBUG] ステップ応答推定開始")
+    print("[DEBUG] ステップ応答推定開始（最小二乗法フィッティング）")
     
     try:
+        # コヒーレンスフィルタリング（0.7以上のデータのみ使用）
+        valid_mask = coherence >= coherence_threshold
+        n_valid = np.sum(valid_mask)
+        
+        if n_valid < 3:
+            print(f"[WARNING] コヒーレンス >= {coherence_threshold} のデータが不足しています（{n_valid}点）")
+            print("[WARNING] フィッティングをスキップします")
+            return None, None, None, None
+        
+        magnitude_db_filtered = magnitude_db[valid_mask]
+        phase_deg_filtered = phase_deg[valid_mask]
+        frequency_hz_filtered = frequency_hz[valid_mask]
+        
+        print(f"[DEBUG] 全データポイント数: {len(magnitude_db)}")
+        print(f"[DEBUG] コヒーレンス >= {coherence_threshold} のデータ: {n_valid}点 ({100*n_valid/len(magnitude_db):.1f}%)")
+        
+        # 【低周波フィッティング用フィルタ】5Hz以下のデータのみを使用
+        low_freq_mask = frequency_hz_filtered <= 5.0
+        n_low_freq_points = np.sum(low_freq_mask)
+        
+        if n_low_freq_points < 3:
+            print(f"[WARNING] 周波数 <= 5Hz のデータが不足しています（{n_low_freq_points}点）")
+            print("[WARNING] フィッティングをスキップします")
+            return None, None, None, None
+        
+        magnitude_db_filtered = magnitude_db_filtered[low_freq_mask]
+        phase_deg_filtered = phase_deg_filtered[low_freq_mask]
+        frequency_hz_filtered = frequency_hz_filtered[low_freq_mask]
+        
+        print(f"[DEBUG] 周波数 <= 5Hz のデータ: {n_low_freq_points}点 ({100*n_low_freq_points/n_valid:.1f}%)")
+        print(f"[DEBUG] 【低周波フィッティング】周波数範囲: {frequency_hz_filtered[0]:.2f} - {frequency_hz_filtered[-1]:.2f} Hz")
+        
         # ボード線図を複素数に変換
-        magnitude_linear = 10 ** (magnitude_db / 20)
-        phase_rad = np.radians(phase_deg)
+        magnitude_linear = 10 ** (magnitude_db_filtered / 20)
+        phase_rad = np.radians(phase_deg_filtered)
         H_jw = magnitude_linear * np.exp(1j * phase_rad)
+        omega = 2 * np.pi * frequency_hz_filtered
         
-        print(f"[DEBUG] 周波数応答データポイント数: {len(magnitude_linear)}")
+        print(f"[DEBUG] ゲイン範囲（線形）: {magnitude_linear.min():.3f} - {magnitude_linear.max():.3f}")
+        print(f"[DEBUG] ゲイン範囲（dB）: {magnitude_db_filtered.min():.2f} - {magnitude_db_filtered.max():.2f} dB")
         
-        # DC ゲイン（低周波ゲイン）
-        dc_gain = magnitude_linear[0] if len(magnitude_linear) > 0 else 1.0
+        # 初期値推定（改良版・低周波フィッティング用）
+        # 低周波（最初の5点または全体の20%）の平均をDCゲインとする
+        n_low_freq_init = max(3, min(5, len(magnitude_linear) // 5))
+        dc_gain_init = np.mean(magnitude_linear[:n_low_freq_init])
         
-        # カットオフ周波数（-3dB周波数）付近を探す
-        target_mag = dc_gain / np.sqrt(2)
+        # カットオフ周波数：ゲインが半減する点を探す
+        target_mag = dc_gain_init / np.sqrt(2)
         idx_3db = np.argmin(np.abs(magnitude_linear - target_mag))
-        omega_c = 2 * np.pi * frequency_hz[idx_3db]
         
-        print(f"[DEBUG] DCゲイン: {dc_gain:.3f}")
-        print(f"[DEBUG] カットオフ周波数: {frequency_hz[idx_3db]:.2f} Hz ({omega_c:.2f} rad/s)")
+        # 低周波帯でゲインが減衰しているか確認
+        if magnitude_linear[-1] > dc_gain_init * 0.7:
+            # 低周波帯でも減衰しないパターン
+            omega_c_init = 2 * np.pi * frequency_hz_filtered[len(frequency_hz_filtered)//3]
+            print("[DEBUG] 【警告】低周波帯でもゲインが減衰していません（積分器的特性の可能性）")
+        else:
+            omega_c_init = 2 * np.pi * frequency_hz_filtered[idx_3db]
         
-        # 1次遅れシステム: G(s) = K / (tau*s + 1)
-        K = dc_gain
-        tau = 1.0 / omega_c if omega_c > 0 else 1.0
+        tau_init = 1.0 / omega_c_init if omega_c_init > 0 else 0.1
         
-        # 転送関数
+        # 初期値を低周波フィッティング用の制約範囲内に収める
+        # 低周波では時定数が大きくなる傾向があるため、上限を拡大
+        tau_init = np.clip(tau_init, 0.001, 100.0)  # 低周波: 上限を拡大（元: 10秒）
+        dc_gain_init = np.clip(dc_gain_init, 1.0, 10000.0)
+        
+        print(f"[DEBUG] 初期値: K={dc_gain_init:.3f}, τ={tau_init:.6f} s")
+        print(f"[DEBUG] 初期カットオフ周波数: {1/(2*np.pi*tau_init):.2f} Hz")
+        
+        # 1次遅れモデルの周波数応答
+        def first_order_model(omega_vals, K, T):
+            """G(jω; K,T) = K / (1 + jωT)"""
+            return K / (1 + 1j * omega_vals * T)
+        
+        # 重み付け：低周波を重視（高周波はノイズの影響を受けやすい）
+        # 周波数に反比例する重み
+        weights = 1.0 / (1.0 + frequency_hz_filtered / frequency_hz_filtered[0])
+        weights = weights / np.max(weights)  # 正規化
+        
+        # 残差関数（実部と虚部を分離、重み付け、スケーリング）
+        def residuals(params):
+            K, T = params
+            if K <= 0 or T <= 0:
+                return np.ones(2 * len(omega)) * 1e10  # ペナルティ
+            
+            G_model = first_order_model(omega, K, T)
+            error_complex = H_jw - G_model
+            
+            # スケーリング：測定値の大きさで正規化
+            scale = np.abs(H_jw) + 1e-10
+            error_normalized = error_complex / scale
+            
+            # 重み付けを適用
+            error_weighted = error_normalized * np.sqrt(weights)
+            
+            # 実部と虚部を連結して返す
+            return np.concatenate([error_weighted.real, error_weighted.imag])
+        
+        # 最小二乗法で最適化
+        print("[DEBUG] 非線形最小二乗法でフィッティング中（低周波: ≤5Hz）...")
+        # より現実的な制約：
+        # K: 1～10,000（線形ゲイン）
+        # τ: 0.001～100秒（低周波フィッティングでは時定数が大きくなる傾向）
+        result = least_squares(
+            residuals,
+            x0=[dc_gain_init, tau_init],
+            bounds=([1.0, 0.001], [10000.0, 100.0]),  # K, τ の範囲制約
+            method='trf',
+            verbose=0,
+            ftol=1e-8,
+            xtol=1e-8,
+            max_nfev=1000
+        )
+        
+        if not result.success:
+            print(f"[WARNING] 最適化が収束しませんでした: {result.message}")
+        
+        K, tau = result.x
+        print(f"[DEBUG] フィッティング結果: K={K:.3f}, τ={tau:.6f} s")
+        print(f"[DEBUG] カットオフ周波数: {1/(2*np.pi*tau):.2f} Hz")
+        print(f"[DEBUG] 残差ノルム: {np.linalg.norm(result.fun):.6f}")
+        print(f"[DEBUG] 最適化ステータス: {result.message}")
+        
+        # フィッティング品質の確認
+        G_fitted = first_order_model(omega, K, tau)
+        mag_fitted = np.abs(G_fitted)
+        relative_error = np.mean(np.abs(magnitude_linear - mag_fitted) / magnitude_linear)
+        print(f"[DEBUG] 平均相対誤差: {relative_error*100:.1f}%")
+        
+        # 制約に張り付いていないか確認
+        if K >= 9999.0:
+            print("[WARNING] DCゲインが上限に達しています（モデルが適合していない可能性）")
+        if tau >= 9.9:
+            print("[WARNING] 時定数が上限に達しています（モデルが適合していない可能性）")
+        
+        # フィットした1次遅れモデルの転送関数を構築
         num = [K]
         den = [tau, 1]
         sys = ctl.TransferFunction(num, den)
         
-        print(f"[DEBUG] 推定システム: G(s) = {K:.3f} / ({tau:.6f}*s + 1)")
+        print(f"[DEBUG] フィット後システム: G(s) = {K:.3f} / ({tau:.6f}*s + 1)")
         
         # ステップ応答計算
         t = np.linspace(0, 5*tau, 1000)
@@ -476,14 +607,15 @@ def estimate_step_response(magnitude_db: np.ndarray,
             settling_time = t_step[-1]
         print(f"  整定時間 (±2%): {settling_time:.4f} s")
         
-        print(f"✓ ステップ応答計算完了")
-        print(f"  最終値: {y_step[-1]:.3f}")
+        print(f"✓ ステップ応答計算完了（最小二乗法フィッティング）")
+        print(f"  DCゲイン K: {K:.3f}")
         print(f"  時定数 τ: {tau:.6f} s")
+        print(f"  最終値: {y_step[-1]:.3f}")
         print(f"  整定時間 (±2%): {settling_time:.4f} s")
         
         return t_step, y_step, tau, settling_time
     except Exception as e:
-        print(f"[DEBUG] 警告: ステップ応答推定失敗: {e}")
+        print(f"[DEBUG] 警告: ステップ応答推定失敗（最小二乗法フィッティング）: {e}")
         import traceback
         traceback.print_exc()
         return None, None, None, None
@@ -800,7 +932,7 @@ def main():
     
     print(f"\n[ステップ 6] ステップ応答推定...")
     
-    t_step, y_step, tau, settling_time = estimate_step_response(mag_db, phase_deg, freq)
+    t_step, y_step, tau, settling_time = estimate_step_response(mag_db, phase_deg, freq, coherence)
 
     if y_step is not None and tau is not None and settling_time is not None:
         print(f"✓ ステップ応答計算完了")

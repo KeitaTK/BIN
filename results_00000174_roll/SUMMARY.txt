@@ -33,7 +33,7 @@ ArduPilot System Identification 解析結果
 - 02_step_response.png
 
 【 ステップ応答特性 】
-時定数 τ: 0.003690 s
-整定時間 (±2%): 0.0134 s
+時定数 τ: 0.863797 s
+整定時間 (±2%): 3.1344 s
 - bode_data.csv
 - SUMMARY.txt
