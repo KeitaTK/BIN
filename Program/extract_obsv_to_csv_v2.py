@@ -5,12 +5,63 @@ OBSVメッセージ抽出プログラム（改善版）
 ARduPilot ログフォーマットに基づいて正確に解析
 """
 
+
 import struct
 import os
 import sys
 import csv
+import math
 
 class OBSVExtractorV2:
+    def analyze_records(self, records):
+        print("\n[ANALYZE] データ内容チェック")
+        if not records:
+            print("  レコードがありません")
+            return
+
+        timeus_list = [r['TimeUS'] for r in records]
+        plx_list = [r['PLX'] for r in records]
+        nan_count = 0
+        inf_count = 0
+        extreme_count = 0
+        decreasing_count = 0
+        duplicate_count = 0
+        prev_timeus = None
+        timeus_set = set()
+        for t in timeus_list:
+            if prev_timeus is not None:
+                if t < prev_timeus:
+                    decreasing_count += 1
+                if t == prev_timeus:
+                    duplicate_count += 1
+            prev_timeus = t
+            timeus_set.add(t)
+        for r in records:
+            for k, v in r.items():
+                if isinstance(v, float):
+                    if math.isnan(v):
+                        nan_count += 1
+                    if math.isinf(v):
+                        inf_count += 1
+                    if abs(v) > 1e10:
+                        extreme_count += 1
+        print(f"  総レコード数: {len(records)}")
+        print(f"  TimeUS最小: {min(timeus_list)}")
+        print(f"  TimeUS最大: {max(timeus_list)}")
+        print(f"  TimeUS一意数: {len(timeus_set)}")
+        print(f"  TimeUS減少回数: {decreasing_count}")
+        print(f"  TimeUS重複回数: {duplicate_count}")
+        print(f"  NaN値: {nan_count}")
+        print(f"  Inf値: {inf_count}")
+        print(f"  極端値(>|1e10|): {extreme_count}")
+        print(f"  PLXサンプル: {plx_list[:5]}")
+        if decreasing_count > 0:
+            print("  [警告] TimeUSが減少する箇所があります")
+        if nan_count > 0 or inf_count > 0:
+            print("  [警告] NaN/Inf値を含むデータがあります")
+        if extreme_count > 0:
+            print("  [警告] 極端な値を含むデータがあります")
+        print("[ANALYZE] チェック終了\n")
     def __init__(self, bin_file_path, csv_output_path):
         self.bin_file_path = bin_file_path
         self.csv_output_path = csv_output_path
@@ -72,9 +123,17 @@ class OBSVExtractorV2:
                     header_line = data[header_pos:header_end].decode('utf-8', errors='ignore')
                     print(f"[DEBUG] ヘッダー: {header_line[:80]}")
                     
-                    # ヘッダーの直後からデータが始まる
+                    # ヘッダーの後、最初の ArduPilot メッセージヘッダー(0xA3 0x95)を探す
                     data_start = header_end
                     while data_start < len(data) and data[data_start] in [0x0a, 0x0d, 0x00]:
+                        data_start += 1
+                    
+                    # 0xA3 0x95 を探す
+                    search_limit = min(len(data), header_end + 100)
+                    while data_start < search_limit:
+                        if data_start + 2 < len(data) and data[data_start] == 0xA3 and data[data_start+1] == 0x95:
+                            print(f"[DEBUG] 最初のメッセージヘッダー位置: 0x{data_start:x}")
+                            break
                         data_start += 1
                     
                     msg_info.append({
@@ -96,68 +155,94 @@ class OBSVExtractorV2:
     def extract_message_records(self, data, msg_info):
         """メッセージグループからデータレコードを抽出"""
         data_start = msg_info['data_start']
-        end_pos = msg_info.get('next_obsv', len(data))
+        end_pos = msg_info.get('next_obsv')
+        if end_pos is None:
+            end_pos = len(data)
         
-        # データレコードサイズ: TimeUS (8) + floats (15*4) = 68 bytes
-        record_size = 68
+        # ArduPilotメッセージヘッダー: 0xA3 0x95 + メッセージID (1バイト)
+        # OBSVのメッセージIDを特定する必要がある
+        # データレコードサイズ: ヘッダー(3) + TimeUS(8) + floats(15*4) = 71 bytes
         
         records = []
         current_pos = data_start
+        msg_id = None
         
-        while current_pos + record_size <= end_pos:
+        # 最初のメッセージIDを特定
+        if current_pos + 3 <= len(data):
+            if data[current_pos] == 0xA3 and data[current_pos+1] == 0x95:
+                msg_id = data[current_pos+2]
+                print(f"[DEBUG] OBSVメッセージID: 0x{msg_id:02x}")
+        
+        if msg_id is None:
+            print(f"[ERROR] メッセージIDを特定できません")
+            return records
+        
+        # ファイル全体を走査してOBSVメッセージID (0xf9など) を持つメッセージを抽出
+        print(f"[DEBUG] ファイル全体を走査してメッセージID 0x{msg_id:02x} を検索...")
+        current_pos = 0
+        scan_count = 0
+        
+        while current_pos + 71 <= len(data):
             try:
-                # TimeUS
-                time_us = struct.unpack('<Q', data[current_pos:current_pos+8])[0]
-                
-                # floats
-                floats_data = data[current_pos+8:current_pos+68]
-                floats = struct.unpack('<15f', floats_data)
-                
-                # データの妥当性チェック
-                # TimeUS は通常 1e12 ～ 1e15 程度（マイクロ秒）
-                # floats は -1e5 ～ 1e5 程度
-                
-                valid = True
-                
-                # TimeUS の妥当性チェック
-                if not (1e10 < time_us < 1e16):
-                    print(f"[DEBUG] TimeUS が範囲外: {time_us}")
-                    valid = False
-                
-                # float値の妥当性チェック
-                if valid:
-                    for i, f in enumerate(floats):
-                        if f > 1e8 or f < -1e8:
-                            if i not in [2, 9, 13, 14]:  # 一部フィールドは大きい値の可能性
-                                print(f"[DEBUG] float[{i}] が範囲外: {f}")
-                
-                if valid:
-                    record = {
-                        'TimeUS': time_us,
-                        'PLX': floats[0],
-                        'PLY': floats[1],
-                        'PLZ': floats[2],
-                        'AX': floats[3],
-                        'AY': floats[4],
-                        'BX': floats[5],
-                        'BY': floats[6],
-                        'CX': floats[7],
-                        'CY': floats[8],
-                        'PRX': floats[9],
-                        'PRY': floats[10],
-                        'PRZ': floats[11],
-                        'ERR': floats[12],
-                        'EST_FREQ': floats[13],
-                        'CORR': floats[14],
-                    }
-                    records.append(record)
-                    current_pos += record_size
-                else:
-                    break
+                # メッセージヘッダーをチェック
+                if data[current_pos] == 0xA3 and data[current_pos+1] == 0x95:
+                    current_msg_id = data[current_pos+2]
                     
+                    # OBSVメッセージIDと一致する場合のみ処理
+                    if current_msg_id == msg_id:
+                        # データ部分を読み取り (ヘッダー3バイトをスキップ)
+                        data_pos = current_pos + 3
+                        
+                        # TimeUS (8 bytes, uint64)
+                        time_us = struct.unpack('<Q', data[data_pos:data_pos+8])[0]
+                        
+                        # floats (15 * 4 bytes)
+                        floats_data = data[data_pos+8:data_pos+68]
+                        floats = struct.unpack('<15f', floats_data)
+                        
+                        record = {
+                            'TimeUS': time_us,
+                            'PLX': floats[0],
+                            'PLY': floats[1],
+                            'PLZ': floats[2],
+                            'AX': floats[3],
+                            'AY': floats[4],
+                            'BX': floats[5],
+                            'BY': floats[6],
+                            'CX': floats[7],
+                            'CY': floats[8],
+                            'PRX': floats[9],
+                            'PRY': floats[10],
+                            'PRZ': floats[11],
+                            'ERR': floats[12],
+                            'EST_FREQ': floats[13],
+                            'CORR': floats[14],
+                        }
+                        
+                        # デバッグ出力（最初の数レコードのみ）
+                        if len(records) < 5:
+                            print(f"[DEBUG] レコード {len(records)+1}: TimeUS={time_us}, PLX={floats[0]:.6f}, PLY={floats[1]:.6f}, PLZ={floats[2]:.6f}")
+                        
+                        records.append(record)
+                        current_pos += 71  # ヘッダー(3) + データ(68)
+                    else:
+                        # 異なるメッセージIDなので3バイト進む
+                        current_pos += 3
+                    
+                    scan_count += 1
+                    if scan_count % 50000 == 0:
+                        print(f"[DEBUG] 走査中... {len(records)} レコード抽出 (位置 0x{current_pos:x})")
+                else:
+                    current_pos += 1  # 1バイト進めて再検索
+
             except Exception as e:
                 print(f"[DEBUG] レコード解析エラー (位置 0x{current_pos:x}): {e}")
-                break
+                current_pos += 1
+
+        # データ内容チェック
+        print(f"[DEBUG] 抽出レコード数: {len(records)}")
+        if len(records) > 0:
+            self.analyze_records(records)
         
         return records
     
@@ -220,8 +305,8 @@ class OBSVExtractorV2:
         return self.write_csv()
 
 def main():
-    bin_file = "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000400.BIN"
-    csv_file = "C:\\Users\\taki\\Local\\local\\BIN\\Program\\OBSV_data.csv"
+    bin_file = "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000404.BIN"
+    csv_file = os.path.expanduser("~\\Downloads\\OBSV_data_00000404.csv")
     
     if not os.path.exists(bin_file):
         print(f"[ERROR] ファイルが見つかりません: {bin_file}")
@@ -231,6 +316,7 @@ def main():
     success = extractor.run()
     
     sys.exit(0 if success else 1)
+
 
 if __name__ == "__main__":
     main()
