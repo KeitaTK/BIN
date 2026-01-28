@@ -16,6 +16,15 @@ except ImportError:
     print("[ERROR] pymavlinkが必要です: pip install pymavlink")
     sys.exit(1)
 
+# ==================== 設定セクション（ここでファイル名を指定） ====================
+# 読み込むBINファイル名（ここを変更してください）
+# 例: "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000414.BIN"
+INPUT_BIN_FILE = "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000422.BIN"
+
+# 出力ディレクトリ（自動的にファイル名が生成されます）
+OUTPUT_DIRECTORY = os.path.expanduser("~\\Downloads")
+# =================================================================================
+
 def extract_obsv_new_format(bin_file_path, csv_output_path):
     """
     pymavlinkを使用してOBSVメッセージを抽出してCSV化
@@ -102,7 +111,37 @@ def extract_obsv_new_format(bin_file_path, csv_output_path):
         print(f"[ERROR] CSV出力エラー: {e}")
         return False
 
-if __name__ == "__main__":
-    bin_file = "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000414.BIN"
-    csv_file = os.path.expanduser("~\\Downloads\\OBSV_data_00000417.csv")
+def main():
+    """
+    メイン処理：設定セクションで指定されたBINファイルを処理します
+    INPUT_BIN_FILE をプログラム冒頭で変更して使用してください
+    """
+    global INPUT_BIN_FILE, OUTPUT_DIRECTORY
+    
+    # 設定セクションから読み込むファイルを取得
+    bin_file = INPUT_BIN_FILE
+    
+    # ファイルの存在確認
+    if not os.path.exists(bin_file):
+        print(f"[ERROR] ファイルが見つかりません: {bin_file}")
+        print(f"[INFO] INPUT_BIN_FILE を確認してください: {bin_file}")
+        sys.exit(1)
+    
+    # ファイル名から番号を抽出してCSV出力ファイル名を生成
+    bin_filename = os.path.basename(bin_file)
+    if bin_filename.endswith('.BIN'):
+        file_number = bin_filename.replace('.BIN', '')
+    else:
+        file_number = bin_filename
+    
+    csv_file = os.path.join(OUTPUT_DIRECTORY, f"OBSV_data_{file_number}.csv")
+    
+    print(f"[INFO] 処理開始:")
+    print(f"  入力: {bin_file}")
+    print(f"  出力: {csv_file}")
+    
     extract_obsv_new_format(bin_file, csv_file)
+
+
+if __name__ == "__main__":
+    main()
