@@ -20,7 +20,7 @@ except ImportError:
 # ==================== 設定セクション（ここでファイル名を指定） ====================
 # 読み込むBINファイル名（ここを変更してください）
 # 例: "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000426.BIN"
-INPUT_BIN_FILE = "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000435.BIN"
+INPUT_BIN_FILE = "C:\\Users\\taki\\Local\\local\\BIN\\1\\00000444.BIN"
 
 # 出力ディレクトリ（自動的にファイル名が生成されます）
 OUTPUT_DIRECTORY = os.path.expanduser("~\\Downloads")
